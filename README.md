@@ -149,6 +149,27 @@ curl -fsSL <url> | bash -s -- --help
 Calibrate once on a **known-managed** and a **known-clean** machine with `--report` before trusting
 verdicts in volume.
 
+## Intel and Apple silicon
+
+The script is pure shell with no architecture-specific code, no compiled parts and no Rosetta
+dependency, so it behaves the same on **Intel (with or without T2) and Apple silicon**. Two
+hardware differences are handled explicitly rather than ignored:
+
+- **Activation Lock only exists on Apple silicon and Intel Macs with the T2 chip.** On a pre-T2
+  Intel Mac `system_profiler` reports no such field, and the report says *"not applicable — this
+  Mac has no T2 chip and is not Apple silicon"* rather than a bare blank, so you can tell "this
+  hardware has no Activation Lock" from "the check didn't run". The other signals are unaffected.
+- **Entering Recovery differs** (hold the power button on Apple silicon; ⌘R or ⌘⌥R on Intel), and
+  **Intel Internet Recovery** boots a network image that need not look like a normal Recovery
+  volume. Detection therefore does not rely on recovery-specific markers alone: every full macOS
+  install firmlinks its Data volume at `/System/Volumes/Data`, and no recovery or installer
+  environment does — so if that is missing, the script goes and finds the unit's own volume
+  instead of reading its own.
+
+On a very old Intel Mac still using **HFS+** rather than APFS, the Recovery volume probe finds
+nothing and returns NOT CONFIRMED (fail-safe). A normal full boot is unaffected, since it reads the
+records directly without needing the probe.
+
 ## Requirements
 
 macOS, and either an admin account (you'll be prompted for `sudo`; the password is read from the

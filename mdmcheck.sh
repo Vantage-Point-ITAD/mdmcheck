@@ -38,7 +38,7 @@
 # same test vectors as the reference implementation and proven identical under both bash and zsh.
 set -u
 
-MDMCHECK_VERSION="2.3.0"
+MDMCHECK_VERSION="2.4.0"
 
 # ---------------------------------------------------------------- args (work when piped via -s --)
 REPORT_ONLY=0
@@ -162,7 +162,7 @@ if [ "${MDMCHECK_CLASSIFY_ONLY:-0}" = "1" ]; then
   AL="${AL:-}"; DEP_SHOW="${DEP_SHOW:-}"; DEP_SHOW_RC="${DEP_SHOW_RC:--1}"
   DEP_STATUS="${DEP_STATUS:-}"; DISK_STATE="${DISK_STATE:-notfound}"
   DISK_MARKERS="${DISK_MARKERS:-}"
-  SERIAL="TEST"; MODEL="TEST"; OSVER="TEST"; SOURCE_DESC="test"; IN_RECOVERY=0
+  SERIAL="TEST"; MODEL="TEST"; OSVER="TEST"; SOURCE_DESC="test"; IN_RECOVERY=0; AL_APPLICABLE=1
 else
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "mdmcheck: macOS only." >&2
@@ -177,6 +177,14 @@ _root_vol="$(diskutil info / 2>/dev/null | awk -F': +' '/Volume Name/{print $2; 
 IN_RECOVERY=0
 [ -d /System/Installation ] && IN_RECOVERY=1
 case "$(_lc "${_root_vol:-}")" in *recovery*) IN_RECOVERY=1 ;; esac
+# Decisive test, and the one that covers environments the two markers above miss — notably Intel
+# Internet Recovery (Cmd-Opt-R), which boots a network image that need not carry
+# /System/Installation nor a volume named "recovery". EVERY normal macOS install firmlinks its Data
+# volume at /System/Volumes/Data; no recovery/installer environment does. If that is not mounted we
+# are not on a full install, so we must go and find the unit's volume rather than read our own.
+if ! mount 2>/dev/null | grep -q ' /System/Volumes/Data '; then
+  IN_RECOVERY=1
+fi
 
 TARGET_ROOT=""          # "" = the running system; otherwise a mounted volume to read
 SOURCE_DESC="this Mac (running system)"
@@ -269,6 +277,18 @@ MODEL="$(_trim "$(printf '%s\n' "$HW" | awk -F': ' '/Model Name/{print $2; exit}
 [ -n "$MODEL" ] || MODEL="$(_trim "$(printf '%s\n' "$HW" | awk -F': ' '/Model Identifier/{print $2; exit}')")"
 AL="$(_trim "$(printf '%s\n' "$HW" | awk -F': ' '/Activation Lock Status/{print $2; exit}')")"
 OSVER="$(sw_vers -productVersion 2>/dev/null) ($(sw_vers -buildVersion 2>/dev/null))"
+# Activation Lock exists only on Apple silicon and Intel Macs with the T2 chip. On a pre-T2 Intel
+# Mac system_profiler reports no such field — which is "no such feature", NOT "the check failed".
+# Saying so stops an operator reading a blank as a failed check.
+AL_APPLICABLE=1
+if [ -z "$AL" ]; then
+  if [ "$(uname -m 2>/dev/null)" = "arm64" ] \
+     || system_profiler SPiBridgeDataType 2>/dev/null | grep -qi 'T2'; then
+    AL_APPLICABLE=1
+  else
+    AL_APPLICABLE=0
+  fi
+fi
 [ -n "$SERIAL" ] || SERIAL="UNKNOWN"
 [ -n "$MODEL" ] || MODEL="Unknown"
 
@@ -486,7 +506,13 @@ else
   elif _has_any_line "$low_show" "$CLEAN_MARKERS"; then
     _add "(cloud) DEP query returned 'not assigned' — but that answer is NOT reliable"
   fi
-  _add "Activation Lock: ${AL:-not reported}"
+  if [ -n "$AL" ]; then
+    _add "Activation Lock: $AL"
+  elif [ "${AL_APPLICABLE:-1}" = "0" ]; then
+    _add "Activation Lock: not applicable — this Mac has no T2 chip and is not Apple silicon, so it does not support Activation Lock"
+  else
+    _add "Activation Lock: not reported"
+  fi
 fi
 
 # ---------------------------------------------------------------- calibration dump
