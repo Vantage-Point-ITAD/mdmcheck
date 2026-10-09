@@ -38,7 +38,7 @@
 # same test vectors as the reference implementation and proven identical under both bash and zsh.
 set -u
 
-MDMCHECK_VERSION="2.1.1"
+MDMCHECK_VERSION="2.2.0"
 
 # ---------------------------------------------------------------- args (work when piped via -s --)
 REPORT_ONLY=0
@@ -81,6 +81,18 @@ mdm_service_address'
 # are NOT management markers. Treating them as markers is what once flagged clean stock as MANAGED.
 DISK_NEGATIVE_MARKERS='.cloudconfigrecordnotfound
 .cloudconfignoactivationrecord'
+
+# Records that genuinely assert "this device was assigned". Anything NOT in this list and not in
+# the negative list above is UNRECOGNISED: still treated as managed (fail-safe — never silently
+# clear something we don't understand), but reported separately so an operator can see that the
+# verdict rests on an unknown record rather than a confirmed management signal. Seen in the field:
+# .cloudConfigTimerCheck, whose name suggests check-throttling bookkeeping rather than a
+# management assertion — unverified, so it stays fail-safe, but it is no longer presented as proof.
+DISK_KNOWN_MANAGED_MARKERS='.cloudconfigrecordfound
+.cloudconfighasactivationrecord
+.cloudconfigprofileinstalled
+com.apple.depreceipt
+.configuratorenrollment'
 
 CLEAN_MARKERS='not dep enabled
 no enrollment configurations
@@ -328,6 +340,8 @@ if [ "$rc" = "0" ] && _has_any_line "$low_show" "$MANAGED_MARKERS"; then
 fi
 
 disk_managed_list=""
+disk_known_list=""
+disk_unknown_list=""
 disk_negative_list=""
 while IFS= read -r _m; do
   _m="$(_trim "$_m")"
@@ -344,6 +358,18 @@ EOF
     disk_negative_list="${disk_negative_list:+$disk_negative_list, }$_m"
   else
     disk_managed_list="${disk_managed_list:+$disk_managed_list, }$_m"
+    _known=0
+    while IFS= read -r _k; do
+      [ -n "$_k" ] || continue
+      [ "$_ml" = "$_k" ] && { _known=1; break; }
+    done <<EOF
+$DISK_KNOWN_MANAGED_MARKERS
+EOF
+    if [ "$_known" = "1" ]; then
+      disk_known_list="${disk_known_list:+$disk_known_list, }$_m"
+    else
+      disk_unknown_list="${disk_unknown_list:+$disk_unknown_list, }$_m"
+    fi
   fi
 done <<EOF
 $(printf '%s' "$DISK_MARKERS" | tr ',' '\n')
@@ -376,10 +402,29 @@ REASONS=""
 _add() { REASONS="${REASONS:+$REASONS
 }$1"; }
 if [ "$managed" = "1" ]; then
-  [ "$disk_managed" = "1" ] && _add "On-disk DEP/MDM records on this Mac: $disk_managed_list"
+  [ -n "$disk_known_list" ] && _add "On-disk DEP/MDM records on this Mac: $disk_known_list"
+  [ -n "$disk_unknown_list" ] && _add "Unrecognised .cloudConfig* record(s), counted as managed only as a fail-safe (NOT confirmed proof of management): $disk_unknown_list"
   [ "$al_enabled" = "1" ] && _add "Activation Lock: Enabled"
   [ "$show_has_config" = "1" ] && _add "DEP/ADE enrollment configuration returned by the cloud query"
   [ "$dep_status_yes" = "1" ] && _add "Local status reports Enrolled via DEP: Yes"
+  # Stale-record pattern: the on-disk records are the ONLY thing asserting management, while the
+  # live checks completed and both say no. On-disk records are a snapshot from when Setup Assistant
+  # last ran — a release afterwards does not rewrite them — so this combination is what a released
+  # unit looks like until it is erased and re-provisioned with a network connection.
+  _show_answered_no=0
+  if [ "$rc" = "0" ] || _has_any_line "$low_show" "$CLEAN_MARKERS"; then
+    if [ "$show_has_config" = "0" ] \
+       && ! _has_any_line "$low_show" "$CLOUD_FAIL_MARKERS" \
+       && ! _has_any_line "$low_show" "$NET_ERROR_MARKERS" \
+       && ! _has_any_line "$low_show" "$RUN_ERROR_MARKERS"; then
+      _show_answered_no=1
+    fi
+  fi
+  case "$low_status" in *"enrolled via dep: no"*) _status_no=1 ;; *) _status_no=0 ;; esac
+  if [ "$disk_managed" = "1" ] && [ "$al_enabled" = "0" ] && [ "$show_has_config" = "0" ] \
+     && [ "$dep_status_yes" = "0" ] && [ "$_show_answered_no" = "1" ] && [ "$_status_no" = "1" ]; then
+    _add "NOTE: the live checks DISAGREE with these records — Apple returned no enrollment configuration and local status reports Enrolled via DEP: No. On-disk records are a snapshot from when Setup Assistant last ran and are not rewritten when a device is released, so this is what a RELEASED unit looks like until it is erased and reinstalled WITH A NETWORK CONNECTION at Setup Assistant. Re-check after that reinstall before treating it as still managed."
+  fi
 elif [ "$VERDICT" = "CLEAN" ]; then
   _add "Read this Mac's DEP/MDM activation records directly — none present (on-disk ground truth). Activation Lock not enabled."
   [ -n "$disk_negative_list" ] && _add "On-disk Apple receipt confirms the DEP check ran and returned not-assigned: $disk_negative_list"

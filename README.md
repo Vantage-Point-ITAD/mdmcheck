@@ -44,6 +44,23 @@ falsely report "not assigned". A cloud "no" therefore proves nothing and can nev
 The on-disk activation record is what the device actually holds, so that is the authority; the
 cloud query is kept only as a secondary signal.
 
+### A released Mac can still read MANAGED — and that is expected
+
+The on-disk records are a **snapshot from when Setup Assistant last ran**. Releasing a device in
+Apple Business Manager afterwards does **not** reach back and rewrite them. So a genuinely released
+Mac keeps reading MANAGED until it is **erased and reinstalled with a network connection**, which
+is when it asks Apple again and writes a fresh receipt.
+
+When the on-disk records are the only thing asserting management, and the live checks completed and
+disagree (Apple returned no configuration, local status says `Enrolled via DEP: No`), `mdmcheck`
+says so explicitly in the findings. That combination is what a released-but-not-yet-reprovisioned
+unit looks like. The verdict stays MANAGED — fail-safe — but the note tells you to re-check after
+the reinstall rather than treating the unit as still owned.
+
+Note also that **Recovery can only give a historical answer**: it reads the existing install's
+records and cannot query Apple. The cloud query, which is the only signal reflecting *current*
+assignment, requires a full boot with network.
+
 ### The `.cloudConfig*` trap
 
 Setup Assistant writes a receipt of its DEP check **either way**:
@@ -56,7 +73,11 @@ Setup Assistant writes a receipt of its DEP check **either way**:
 Every clean Mac that completed setup online has one of the negative receipts on disk. Tools that
 glob `.cloudConfig*` and treat any match as "managed" will flag clean machines as managed — we
 shipped that bug once and fixed it. `mdmcheck` classifies the names, and **any unrecognised
-`.cloudConfig*` name still counts as managed**, so an unknown record is never silently cleared.
+`.cloudConfig*` name still counts as managed**, so an unknown record is never silently cleared —
+but it is reported separately as *not confirmed proof of management*, so you can tell a real
+assertion from a record we simply do not recognise. (`.cloudConfigTimerCheck` is one seen in the
+field; its name suggests check-throttling bookkeeping rather than a management assertion, but that
+is unverified, so it stays fail-safe.)
 
 ---
 
