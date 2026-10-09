@@ -19,6 +19,13 @@
 # Usage:  ... | zsh              normal check
 #         ... | zsh -s -- --report    calibration dump, verdict not acted on
 #         ... | zsh -s -- --quiet     no dialog, terminal + report only
+#         ... | zsh -s -- --volume /Volumes/X   read that volume instead of auto-detecting
+#
+# RECOVERY MODE: it also runs from Terminal in macOS Recovery. There, "/" is the RECOVERY volume,
+# NOT the unit — so reading /var/db directly would describe the recovery environment and could
+# report CLEAN for a machine that was never examined. The script detects recoveryOS, locates the
+# unit's own internal Data volume, mounts it READ-ONLY if needed, and reads the records from there.
+# If it cannot identify exactly one target volume it returns NOT CONFIRMED; it never guesses.
 #
 # TEST HOOK: with MDMCHECK_CLASSIFY_ONLY=1 the script skips all gathering, takes AL / DEP_SHOW /
 # DEP_SHOW_RC / DEP_STATUS / DISK_STATE / DISK_MARKERS from the environment, prints "VERDICT=<v>"
@@ -26,13 +33,18 @@
 # same test vectors as the reference implementation and proven identical under both bash and zsh.
 set -u
 
-MDMCHECK_VERSION="2.0.0"
+MDMCHECK_VERSION="2.1.0"
 
 # ---------------------------------------------------------------- args (work when piped via -s --)
 REPORT_ONLY=0
 QUIET=0
+VOLUME_OVERRIDE=""
+_expect_volume=0
 for _a in "$@"; do
+  if [ "$_expect_volume" = "1" ]; then VOLUME_OVERRIDE="$_a"; _expect_volume=0; continue; fi
   case "$_a" in
+    --volume) _expect_volume=1 ;;
+    --volume=*) VOLUME_OVERRIDE="${_a#--volume=}" ;;
     --report) REPORT_ONLY=1 ;;
     --quiet)  QUIET=1 ;;
     --version) echo "mdmcheck $MDMCHECK_VERSION"; exit 0 ;;
@@ -40,6 +52,7 @@ for _a in "$@"; do
       echo "mdmcheck $MDMCHECK_VERSION — Remote Management / Activation-Lock checker (read-only)"
       echo "  --report   dump raw signals for calibration (verdict not acted on)"
       echo "  --quiet    skip the popup; terminal + report file only"
+      echo "  --volume P read the macOS install mounted at P (Recovery / external cases)"
       exit 0 ;;
   esac
 done
@@ -104,6 +117,12 @@ cloudconfigurationerror
 code=34000
 (34000)'
 
+# In Recovery we are already root and `sudo` may be absent — run directly in that case.
+_am_root() { [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; }
+_sudo() {
+  if _am_root; then "$@"; else sudo "$@"; fi
+}
+
 _lc() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 _trim() { printf '%s' "${1:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
@@ -126,11 +145,88 @@ if [ "${MDMCHECK_CLASSIFY_ONLY:-0}" = "1" ]; then
   AL="${AL:-}"; DEP_SHOW="${DEP_SHOW:-}"; DEP_SHOW_RC="${DEP_SHOW_RC:--1}"
   DEP_STATUS="${DEP_STATUS:-}"; DISK_STATE="${DISK_STATE:-notfound}"
   DISK_MARKERS="${DISK_MARKERS:-}"
-  SERIAL="TEST"; MODEL="TEST"; OSVER="TEST"
+  SERIAL="TEST"; MODEL="TEST"; OSVER="TEST"; SOURCE_DESC="test"; IN_RECOVERY=0
 else
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "mdmcheck: macOS only." >&2
   exit 1
+fi
+
+# ---- where are we, and whose records are we about to read? ------------------------------------
+# On a normal boot the running system IS the unit, so /private/var/db is the right place to look.
+# In recoveryOS "/" is the recovery environment; its /var/db says nothing about the unit, so
+# reading it there would be meaningless at best and a false CLEAN at worst.
+_root_vol="$(diskutil info / 2>/dev/null | awk -F': +' '/Volume Name/{print $2; exit}')"
+IN_RECOVERY=0
+[ -d /System/Installation ] && IN_RECOVERY=1
+case "$(_lc "${_root_vol:-}")" in *recovery*) IN_RECOVERY=1 ;; esac
+
+TARGET_ROOT=""          # "" = the running system; otherwise a mounted volume to read
+SOURCE_DESC="this Mac (running system)"
+MOUNTED_BY_US=""
+
+_probe_target_volume() {
+  # Internal APFS Data volumes, excluding whatever we are booted from. Line-by-line (never
+  # `for x in $list`) so bash and zsh behave the same.
+  _cands=""
+  _ids="$(diskutil apfs list 2>/dev/null | grep -E '\(Data\)' | grep -oE 'disk[0-9]+s[0-9]+' | sort -u)"
+  while IFS= read -r _id; do
+    [ -n "$_id" ] || continue
+    _info="$(diskutil info "/dev/$_id" 2>/dev/null)" || continue
+    printf '%s\n' "$_info" | grep -qiE 'Internal: +Yes|Device Location: +Internal' || continue
+    _mp="$(printf '%s\n' "$_info" | awk -F': +' '/Mount Point/{print $2; exit}')"
+    [ "$_mp" = "/" ] && continue
+    [ "$_mp" = "/System/Volumes/Data" ] && [ "$IN_RECOVERY" = "0" ] && continue
+    _cands="${_cands:+$_cands
+}$_id"
+  done <<EOF
+$_ids
+EOF
+  _n="$(printf '%s' "$_cands" | grep -c . || true)"
+  if [ "${_n:-0}" -eq 0 ]; then
+    TARGET_ROOT="__NONE__"; return 0
+  fi
+  if [ "${_n:-0}" -gt 1 ]; then
+    echo "  More than one internal macOS data volume was found:" >&2
+    while IFS= read -r _id; do
+      [ -n "$_id" ] || continue
+      _nm="$(diskutil info "/dev/$_id" 2>/dev/null | awk -F': +' '/Volume Name/{print $2; exit}')"
+      echo "     /dev/$_id   $_nm" >&2
+    done <<EOF
+$_cands
+EOF
+    echo "  Re-run with --volume <mount point> to say which one is the unit." >&2
+    TARGET_ROOT="__AMBIGUOUS__"; return 0
+  fi
+  _id="$(printf '%s' "$_cands" | head -1)"
+  _dev="/dev/$_id"
+  _nm="$(diskutil info "$_dev" 2>/dev/null | awk -F': +' '/Volume Name/{print $2; exit}')"
+  _mp="$(diskutil info "$_dev" 2>/dev/null | awk -F': +' '/Mount Point/{print $2; exit}')"
+  if [ -z "$_mp" ] || [ ! -d "$_mp" ]; then
+    # Mount READ-ONLY. A FileVault-locked volume will refuse; that is NOT CONFIRMED, not CLEAN.
+    if _sudo diskutil mount readOnly "$_dev" >/dev/null 2>&1; then
+      _mp="$(diskutil info "$_dev" 2>/dev/null | awk -F': +' '/Mount Point/{print $2; exit}')"
+      MOUNTED_BY_US="$_dev"
+    else
+      echo "  Could not mount $_nm ($_dev) read-only — it may be FileVault-locked." >&2
+      TARGET_ROOT="__UNREADABLE__"; return 0
+    fi
+  fi
+  TARGET_ROOT="$_mp"
+  SOURCE_DESC="$_nm ($_dev)"
+}
+
+if [ -n "$VOLUME_OVERRIDE" ]; then
+  TARGET_ROOT="$VOLUME_OVERRIDE"
+  SOURCE_DESC="$VOLUME_OVERRIDE (specified with --volume)"
+  if [ ! -d "$TARGET_ROOT" ]; then
+    echo "mdmcheck: --volume path not found: $TARGET_ROOT" >&2
+    exit 1
+  fi
+elif [ "$IN_RECOVERY" = "1" ]; then
+  echo "Recovery environment detected — locating the unit's own system volume."
+  echo "(\"/\" here is the recovery volume; its records say nothing about this Mac.)"
+  _probe_target_volume
 fi
 
 echo "=============================================================="
@@ -138,11 +234,15 @@ echo "  Remote Management / Activation-Lock check  (mdmcheck $MDMCHECK_VERSION)"
 echo "  Read-only: reports status, changes nothing."
 echo "=============================================================="
 echo
-echo "Admin rights are needed to read this Mac's enrollment records."
-# sudo reads its prompt from the terminal, not stdin, so this is safe while piped.
-if ! sudo -v; then
-  echo "Could not obtain admin rights; aborting." >&2
-  exit 1
+if _am_root; then
+  echo "Running as root — no password needed."
+else
+  echo "Admin rights are needed to read this Mac's enrollment records."
+  # sudo reads its prompt from the terminal, not stdin, so this is safe while piped.
+  if ! sudo -v; then
+    echo "Could not obtain admin rights; aborting." >&2
+    exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------- gather
@@ -155,30 +255,53 @@ OSVER="$(sw_vers -productVersion 2>/dev/null) ($(sw_vers -buildVersion 2>/dev/nu
 [ -n "$SERIAL" ] || SERIAL="UNKNOWN"
 [ -n "$MODEL" ] || MODEL="Unknown"
 
-DEP_SHOW="$(sudo profiles show -type enrollment 2>&1)"; DEP_SHOW_RC=$?
-DEP_STATUS="$(sudo profiles status -type enrollment 2>&1)"
+DEP_SHOW="$(_sudo profiles show -type enrollment 2>&1)"; DEP_SHOW_RC=$?
+DEP_STATUS="$(_sudo profiles status -type enrollment 2>&1)"
 
-# On-disk activation records of the RUNNING system (this Mac IS the unit under test).
-# `find` instead of a glob: identical behaviour in bash and zsh.
-DB=/private/var/db
+# On-disk activation records of the UNIT. TARGET_ROOT is "" on a normal boot (the running system
+# is the unit) or a mounted volume in Recovery. The sentinels below mean we could not get at the
+# unit's records at all — those must end as NOT CONFIRMED, never CLEAN.
 DISK_MARKERS=""
-_cc="$(sudo /usr/bin/find "$DB/ConfigurationProfiles/Settings" -maxdepth 1 -name '.cloudConfig*' \
-        -exec /usr/bin/basename {} \; 2>/dev/null)"
-while IFS= read -r _m; do
-  [ -n "$_m" ] || continue
-  DISK_MARKERS="${DISK_MARKERS:+$DISK_MARKERS,}$_m"
-done <<EOF
+case "${TARGET_ROOT:-}" in
+  __NONE__)       DISK_STATE="notfound";   DB=""; SOURCE_DESC="no internal macOS volume found" ;;
+  __AMBIGUOUS__)  DISK_STATE="ambiguous";  DB=""; SOURCE_DESC="multiple volumes; none selected" ;;
+  __UNREADABLE__) DISK_STATE="locked";     DB=""; SOURCE_DESC="volume unreadable (FileVault?)" ;;
+  *)              DB="${TARGET_ROOT}/private/var/db" ;;
+esac
+
+if [ -n "$DB" ]; then
+  _cc="$(_sudo /usr/bin/find "$DB/ConfigurationProfiles/Settings" -maxdepth 1 -name '.cloudConfig*' \
+          -exec /usr/bin/basename {} \; 2>/dev/null)"
+  while IFS= read -r _m; do
+    [ -n "$_m" ] || continue
+    DISK_MARKERS="${DISK_MARKERS:+$DISK_MARKERS,}$_m"
+  done <<EOF
 $_cc
 EOF
-sudo /bin/test -e "$DB/com.apple.DEPReceipt" 2>/dev/null \
-  && DISK_MARKERS="${DISK_MARKERS:+$DISK_MARKERS,}com.apple.DEPReceipt"
-sudo /bin/test -e "$DB/ConfigurationProfiles/Setup/.configuratorEnrollment" 2>/dev/null \
-  && DISK_MARKERS="${DISK_MARKERS:+$DISK_MARKERS,}.configuratorEnrollment"
+  _sudo /bin/test -e "$DB/com.apple.DEPReceipt" 2>/dev/null \
+    && DISK_MARKERS="${DISK_MARKERS:+$DISK_MARKERS,}com.apple.DEPReceipt"
+  _sudo /bin/test -e "$DB/ConfigurationProfiles/Setup/.configuratorEnrollment" 2>/dev/null \
+    && DISK_MARKERS="${DISK_MARKERS:+$DISK_MARKERS,}.configuratorEnrollment"
 
-# The records live on the running system, so they are readable by definition.
-DISK_STATE="readable"
-if [ ! -d "$DB/ConfigurationProfiles" ]; then
-  DISK_STATE="notfound"
+  # CLEAN may only ever come from a read that actually SUCCEEDED. Existence of the directory is
+  # not proof of that: the marker scan runs privileged, so if elevation fails (no terminal for the
+  # prompt, a denied prompt, sudo absent) the scan returns nothing while the unprivileged -d test
+  # still passes — which would score as "readable, no markers" and report CLEAN for a machine we
+  # never actually read. So require the privileged probe itself to succeed first.
+  if ! _sudo /bin/test -e "$DB" 2>/dev/null; then
+    DISK_STATE="locked"
+    SOURCE_DESC="$SOURCE_DESC — privileged read failed"
+  elif _sudo /bin/test -d "$DB/ConfigurationProfiles" 2>/dev/null; then
+    DISK_STATE="readable"
+  else
+    DISK_STATE="notfound"
+    SOURCE_DESC="$SOURCE_DESC — no ConfigurationProfiles store"
+  fi
+fi
+
+# Leave the disk as we found it.
+if [ -n "$MOUNTED_BY_US" ]; then
+  _sudo diskutil unmount "$MOUNTED_BY_US" >/dev/null 2>&1 || true
 fi
 
 fi   # end gather (skipped under MDMCHECK_CLASSIFY_ONLY)
@@ -274,6 +397,7 @@ if [ "$REPORT_ONLY" = "1" ]; then
   echo "== mdmcheck --report (calibration; verdict NOT acted on) =="
   echo "Serial: $SERIAL   Model: $MODEL   macOS: $OSVER"
   echo "Activation Lock raw: '$AL'"
+  echo "Read from : $SOURCE_DESC   (recovery=$IN_RECOVERY)"
   echo "Disk state: $DISK_STATE   markers: '${DISK_MARKERS:-none}'"
   echo "profiles show rc: $DEP_SHOW_RC"
   echo "--- profiles show -type enrollment ---"; printf '%s\n' "${DEP_SHOW:-(no output)}"
@@ -303,6 +427,7 @@ echo
 echo "  Serial : $SERIAL"
 echo "  Model  : $MODEL"
 echo "  macOS  : $OSVER"
+echo "  Read   : $SOURCE_DESC"
 echo "  Verdict: ${COLOR}${VERDICT}${RESET}"
 printf '%s\n' "$REASONS" | while IFS= read -r r; do [ -n "$r" ] && echo "     - $r"; done
 echo
@@ -323,7 +448,8 @@ if mkdir -p "$RDIR" 2>/dev/null; then
     echo "Serial    : $SERIAL"
     echo "Model     : $MODEL"
     echo "macOS     : $OSVER"
-    echo "Checker   : mdmcheck $MDMCHECK_VERSION (run on the unit's own OS)"
+    echo "Checker   : mdmcheck $MDMCHECK_VERSION"
+    echo "Records read from : $SOURCE_DESC"
     echo "Verdict   : $VERDICT"
     echo "Records   : $DISK_STATE"
     echo
@@ -357,6 +483,7 @@ if [ "$QUIET" != "1" ]; then
   MSG="Serial: $SERIAL
 Model: $MODEL
 macOS: $OSVER
+Read: $SOURCE_DESC
 
 Verdict: $VERDICT
 

@@ -57,11 +57,41 @@ shipped that bug once and fixed it. `mdmcheck` classifies the names, and **any u
 
 ---
 
+## Running it from macOS Recovery
+
+It also works from **Utilities → Terminal in macOS Recovery**, which lets you check a unit without
+booting it or creating an account. Join Wi-Fi from the Recovery menu bar first, then run the same
+one-liner.
+
+In Recovery, `/` is the **recovery volume**, not the Mac you are checking — so reading `/var/db`
+there would describe the recovery environment and tell you nothing about the unit. `mdmcheck`
+detects Recovery, finds the unit's own internal Data volume, mounts it **read-only** if it isn't
+already, reads the records from there, and unmounts it again. The volume it used is printed as
+`Read:` in the output and recorded in the proof file, so the verdict is always traceable to a
+specific disk.
+
+If it cannot identify exactly one internal macOS volume it stops at **NOT CONFIRMED** rather than
+guessing:
+
+| Situation | Result |
+|---|---|
+| No internal macOS volume found | NOT CONFIRMED |
+| More than one found | lists them, NOT CONFIRMED — re-run with `--volume <mount point>` |
+| Volume won't mount (FileVault-locked) | NOT CONFIRMED |
+| Elevation failed, so nothing was actually read | NOT CONFIRMED |
+
+Recovery already runs as root, so no password is asked for there.
+
+> **Validate once before relying on it.** The Recovery path has been exercised against real disks
+> but not yet on a full Recovery boot in your environment. Run it in Recovery on a known-clean and
+> a known-managed unit with `--report` and confirm the `Read:` line names the volume you expect.
+
 ## Options
 
 ```sh
 curl -fsSL <url> | zsh -s -- --report   # dump raw signals for calibration; verdict not acted on
 curl -fsSL <url> | zsh -s -- --quiet    # no popup; terminal output + proof file only
+curl -fsSL <url> | zsh -s -- --volume "/Volumes/Macintosh HD - Data"   # read a specific volume
 curl -fsSL <url> | zsh -s -- --help
 ```
 
@@ -70,8 +100,8 @@ verdicts in volume.
 
 ## Requirements
 
-macOS, an admin account, and `sudo` (you'll be prompted; the password is read from the terminal,
-which works fine while the script is piped). **No Python, no Homebrew, no dependencies** — it uses
+macOS, and either an admin account (you'll be prompted for `sudo`; the password is read from the
+terminal, which works fine while the script is piped) or a root shell such as Recovery. **No Python, no Homebrew, no dependencies** — it uses
 only what ships with macOS, so it runs on a freshly installed system where `/usr/bin/python3` is
 still just a stub that would trigger a multi-gigabyte Command Line Tools download.
 
