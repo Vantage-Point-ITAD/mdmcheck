@@ -38,7 +38,7 @@
 # same test vectors as the reference implementation and proven identical under both bash and zsh.
 set -u
 
-MDMCHECK_VERSION="2.2.0"
+MDMCHECK_VERSION="2.3.0"
 
 # ---------------------------------------------------------------- args (work when piped via -s --)
 REPORT_ONLY=0
@@ -279,6 +279,9 @@ DEP_STATUS="$(_sudo profiles status -type enrollment 2>&1)"
 # is the unit) or a mounted volume in Recovery. The sentinels below mean we could not get at the
 # unit's records at all — those must end as NOT CONFIRMED, never CLEAN.
 DISK_MARKERS=""
+MARKER_AGES=""
+SETUP_DONE=""
+CLOUD_ANSWER=""
 case "${TARGET_ROOT:-}" in
   __NONE__)       DISK_STATE="notfound";   DB=""; SOURCE_DESC="no internal macOS volume found" ;;
   __AMBIGUOUS__)  DISK_STATE="ambiguous";  DB=""; SOURCE_DESC="multiple volumes; none selected" ;;
@@ -299,6 +302,27 @@ EOF
     && DISK_MARKERS="${DISK_MARKERS:+$DISK_MARKERS,}com.apple.DEPReceipt"
   _sudo /bin/test -e "$DB/ConfigurationProfiles/Setup/.configuratorEnrollment" 2>/dev/null \
     && DISK_MARKERS="${DISK_MARKERS:+$DISK_MARKERS,}.configuratorEnrollment"
+
+  # WHEN were these records written? That is the difference between "assigned long ago" and
+  # "assigned now". A record older than the client's release date predates the release and is a
+  # leftover; one written during the current provisioning reflects what Apple says today.
+  _marker_path() {
+    case "$1" in
+      com.apple.DEPReceipt)     printf '%s' "$DB/$1" ;;
+      .configuratorEnrollment)  printf '%s' "$DB/ConfigurationProfiles/Setup/$1" ;;
+      *)                        printf '%s' "$DB/ConfigurationProfiles/Settings/$1" ;;
+    esac
+  }
+  while IFS= read -r _m; do
+    _m="$(_trim "$_m")"; [ -n "$_m" ] || continue
+    _ts="$(_sudo /usr/bin/stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$(_marker_path "$_m")" 2>/dev/null)"
+    [ -n "$_ts" ] && MARKER_AGES="${MARKER_AGES:+$MARKER_AGES
+}  $_m  —  written $_ts"
+  done <<EOF
+$(printf '%s' "$DISK_MARKERS" | tr ',' '\n')
+EOF
+  # When Setup Assistant last completed on this install (i.e. when it last asked Apple).
+  SETUP_DONE="$(_sudo /usr/bin/stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$DB/.AppleSetupDone" 2>/dev/null)"
 
   # CLEAN may only ever come from a read that actually SUCCEEDED. Existence of the directory is
   # not proof of that: the marker scan runs privileged, so if elevation fails (no terminal for the
@@ -337,6 +361,28 @@ case "$low_status" in *"enrolled via dep: yes"*) dep_status_yes=1 ;; esac
 show_has_config=0
 if [ "$rc" = "0" ] && _has_any_line "$low_show" "$MANAGED_MARKERS"; then
   show_has_config=1
+fi
+
+# What did the cloud query ACTUALLY do? "Apple answered: nothing assigned" and "the query never
+# completed" are both recorded today as simply "not managed", which throws away the difference that
+# matters when on-disk records and live status disagree. Name the outcome instead, and record it in
+# the proof so the classes can be correlated against real outcomes over time.
+if [ "$show_has_config" = "1" ]; then
+  CLOUD_ANSWER="CONFIG RETURNED — Apple reports this serial IS assigned"
+elif _has_any_line "$low_show" "$CLOUD_FAIL_MARKERS"; then
+  CLOUD_ANSWER="FAILED — request did not complete (e.g. Apple error 34000); answer UNKNOWN"
+elif _has_any_line "$low_show" "$RUN_ERROR_MARKERS"; then
+  CLOUD_ANSWER="FAILED — could not run (needs root); answer UNKNOWN"
+elif _has_any_line "$low_show" "$NET_ERROR_MARKERS"; then
+  CLOUD_ANSWER="FAILED — offline / network error; answer UNKNOWN"
+elif [ "$rc" = "0" ]; then
+  CLOUD_ANSWER="ANSWERED — query completed cleanly (rc=0) and returned NO configuration"
+elif _has_any_line "$low_show" "$CLEAN_MARKERS"; then
+  CLOUD_ANSWER="ANSWERED — returned 'not assigned' (non-zero rc; this wording is NOT reliable on its own)"
+elif [ "$rc" = "-1" ]; then
+  CLOUD_ANSWER="NOT ATTEMPTED"
+else
+  CLOUD_ANSWER="UNRECOGNISED reply (rc=$rc); answer UNKNOWN"
 fi
 
 disk_managed_list=""
@@ -404,6 +450,7 @@ _add() { REASONS="${REASONS:+$REASONS
 if [ "$managed" = "1" ]; then
   [ -n "$disk_known_list" ] && _add "On-disk DEP/MDM records on this Mac: $disk_known_list"
   [ -n "$disk_unknown_list" ] && _add "Unrecognised .cloudConfig* record(s), counted as managed only as a fail-safe (NOT confirmed proof of management): $disk_unknown_list"
+  [ -n "$MARKER_AGES" ] && _add "Those records were written: $(printf '%s' "$MARKER_AGES" | sed 's/^  //' | paste -sd';' - )"
   [ "$al_enabled" = "1" ] && _add "Activation Lock: Enabled"
   [ "$show_has_config" = "1" ] && _add "DEP/ADE enrollment configuration returned by the cloud query"
   [ "$dep_status_yes" = "1" ] && _add "Local status reports Enrolled via DEP: Yes"
@@ -448,6 +495,9 @@ if [ "$REPORT_ONLY" = "1" ]; then
   echo "Serial: $SERIAL   Model: $MODEL   macOS: $OSVER"
   echo "Activation Lock raw: '$AL'"
   echo "Read from : $SOURCE_DESC   (recovery=$IN_RECOVERY)"
+  echo "Setup done: ${SETUP_DONE:-unknown}"
+  echo "Apple says: $CLOUD_ANSWER"
+  [ -n "$MARKER_AGES" ] && { echo "Marker timestamps:"; printf '%s\n' "$MARKER_AGES"; }
   echo "Disk state: $DISK_STATE   markers: '${DISK_MARKERS:-none}'"
   echo "profiles show rc: $DEP_SHOW_RC"
   echo "--- profiles show -type enrollment ---"; printf '%s\n' "${DEP_SHOW:-(no output)}"
@@ -478,6 +528,8 @@ echo "  Serial : $SERIAL"
 echo "  Model  : $MODEL"
 echo "  macOS  : $OSVER"
 echo "  Read   : $SOURCE_DESC"
+[ -n "$SETUP_DONE" ] && echo "  Setup  : last completed $SETUP_DONE (when this Mac last asked Apple)"
+[ -n "$CLOUD_ANSWER" ] && echo "  Apple  : $CLOUD_ANSWER"
 echo "  Verdict: ${COLOR}${VERDICT}${RESET}"
 printf '%s\n' "$REASONS" | while IFS= read -r r; do [ -n "$r" ] && echo "     - $r"; done
 echo
@@ -500,9 +552,16 @@ if mkdir -p "$RDIR" 2>/dev/null; then
     echo "macOS     : $OSVER"
     echo "Checker   : mdmcheck $MDMCHECK_VERSION"
     echo "Records read from : $SOURCE_DESC"
+    [ -n "$SETUP_DONE" ] && echo "Setup completed   : $SETUP_DONE"
+    [ -n "$CLOUD_ANSWER" ] && echo "Apple cloud query : $CLOUD_ANSWER"
     echo "Verdict   : $VERDICT"
     echo "Records   : $DISK_STATE"
     echo
+    if [ -n "$MARKER_AGES" ]; then
+      echo "On-disk record timestamps (compare against the client's release date):"
+      printf '%s\n' "$MARKER_AGES"
+      echo
+    fi
     echo "Findings:"
     printf '%s\n' "$REASONS" | while IFS= read -r r; do [ -n "$r" ] && echo "  - $r"; done
     echo
@@ -515,8 +574,8 @@ if mkdir -p "$RDIR" 2>/dev/null; then
     echo "Raw: profiles status -type enrollment"
     printf '%s\n' "${DEP_STATUS:-(no output)}"
   } > "$RPATH" 2>/dev/null && WROTE="$RPATH"
-  printf '%s  %-16s  %-26s  %s\n' "$TS" "$SERIAL" "$MODEL" "$VERDICT" \
-    >> "$RDIR/mdm_checks.txt" 2>/dev/null
+  printf '%s  %-16s  %-26s  %-13s  apple=%s\n' "$TS" "$SERIAL" "$MODEL" "$VERDICT" \
+    "$(printf '%s' "${CLOUD_ANSWER%% —*}" | tr -d ' ')" >> "$RDIR/mdm_checks.txt" 2>/dev/null
 fi
 if [ -n "$WROTE" ]; then
   echo "  Report : $WROTE"

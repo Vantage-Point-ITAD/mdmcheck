@@ -44,6 +44,28 @@ falsely report "not assigned". A cloud "no" therefore proves nothing and can nev
 The on-disk activation record is what the device actually holds, so that is the authority; the
 cloud query is kept only as a secondary signal.
 
+### Dating the evidence
+
+Every report now carries three timestamps, because *when* a record was written is what separates
+"assigned long ago" from "assigned now":
+
+```
+Setup completed   : 2024-03-11 08:22        <- when this Mac last asked Apple
+Apple cloud query : ANSWERED — query completed cleanly (rc=0) and returned NO configuration
+On-disk record timestamps:
+  .cloudConfigHasActivationRecord  —  written 2024-03-11 08:22
+```
+
+If the records predate the date the client released the device, they cannot reflect the release —
+they are a leftover. If they were written *after* it, the device asked Apple post-release and was
+still told it was assigned, which is a real problem to take back to the client.
+
+The **Apple cloud query** line names what actually happened rather than collapsing everything into
+"not managed". `ANSWERED` and `FAILED … answer UNKNOWN` are very different pieces of evidence, and
+only one of them is worth anything when the on-disk records disagree. The class is also written to
+`mdm_checks.txt`, so after enough units you can check whether a clean `rc=0` answer has ever
+appeared on a genuinely managed Mac — which is the open question behind treating it as unreliable.
+
 ### A released Mac can still read MANAGED — and that is expected
 
 The on-disk records are a **snapshot from when Setup Assistant last ran**. Releasing a device in
