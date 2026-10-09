@@ -1,7 +1,12 @@
 #!/bin/sh
 # mdmcheck.sh — Remote Management (DEP/MDM) + Activation-Lock checker for a Mac on the bench.
 #
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/mdmcheck.sh | zsh
+#   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/mdmcheck.sh | bash
+#
+# Pipe to `bash`, not `zsh`: macOS RECOVERY HAS NO ZSH (confirmed on the bench — "zsh: command not
+# found", after which curl reports error 56 writing to the dead pipe). bash exists both on a full
+# boot and in Recovery, so one command covers both. Recovery's bash is 3.2, so nothing here uses
+# bash-4+ syntax. zsh still works on a full boot if you prefer it.
 #
 # Run it on the unit's OWN macOS, after the temp admin exists. It reports whether this Mac is
 # still assigned to Remote Management / DEP or carries Activation Lock, then writes a proof file.
@@ -33,7 +38,7 @@
 # same test vectors as the reference implementation and proven identical under both bash and zsh.
 set -u
 
-MDMCHECK_VERSION="2.1.0"
+MDMCHECK_VERSION="2.1.1"
 
 # ---------------------------------------------------------------- args (work when piped via -s --)
 REPORT_ONLY=0

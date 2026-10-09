@@ -6,8 +6,11 @@ Management (DEP/ADE)** or carries **Activation Lock** — before you erase or re
 Run it on the Mac you're checking, from that Mac's own macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Vantage-Point-ITAD/mdmcheck/main/mdmcheck.sh | zsh
+curl -fsSL https://raw.githubusercontent.com/Vantage-Point-ITAD/mdmcheck/main/mdmcheck.sh | bash
 ```
+
+Pipe to **`bash`**, not `zsh` — `bash` is present both on a full macOS boot and in Recovery, so the
+same command works everywhere. (`zsh` works on a full boot too, but **Recovery has no zsh**.)
 
 It prints a verdict, shows a popup, and writes a timestamped proof file to
 `~/Desktop/MDM Checks/`.
@@ -61,7 +64,12 @@ shipped that bug once and fixed it. `mdmcheck` classifies the names, and **any u
 
 It also works from **Utilities → Terminal in macOS Recovery**, which lets you check a unit without
 booting it or creating an account. Join Wi-Fi from the Recovery menu bar first, then run the same
-one-liner.
+one-liner — **piped to `bash`**.
+
+> **recoveryOS has no `zsh`.** Piping to `zsh` there fails with `zsh: command not found`, followed
+> by `curl: (56) Failure writing output to destination` — that second error is just curl noticing
+> the pipe's reader died, not a network problem. Recovery's `bash` is 3.2; this script avoids
+> bash-4+ syntax and is tested under `sh`, `bash` and `zsh`.
 
 In Recovery, `/` is the **recovery volume**, not the Mac you are checking — so reading `/var/db`
 there would describe the recovery environment and tell you nothing about the unit. `mdmcheck`
@@ -89,10 +97,10 @@ Recovery already runs as root, so no password is asked for there.
 ## Options
 
 ```sh
-curl -fsSL <url> | zsh -s -- --report   # dump raw signals for calibration; verdict not acted on
-curl -fsSL <url> | zsh -s -- --quiet    # no popup; terminal output + proof file only
-curl -fsSL <url> | zsh -s -- --volume "/Volumes/Macintosh HD - Data"   # read a specific volume
-curl -fsSL <url> | zsh -s -- --help
+curl -fsSL <url> | bash -s -- --report   # dump raw signals for calibration; verdict not acted on
+curl -fsSL <url> | bash -s -- --quiet    # no popup; terminal output + proof file only
+curl -fsSL <url> | bash -s -- --volume "/Volumes/Macintosh HD - Data"   # read a specific volume
+curl -fsSL <url> | bash -s -- --help
 ```
 
 Calibrate once on a **known-managed** and a **known-clean** machine with `--report` before trusting
@@ -105,7 +113,8 @@ terminal, which works fine while the script is piped) or a root shell such as Re
 only what ships with macOS, so it runs on a freshly installed system where `/usr/bin/python3` is
 still just a stub that would trigger a multi-gigabyte Command Line Tools download.
 
-Works identically under `bash` and `zsh`. That is enforced by tests, not assumed: zsh does not
+Works identically under `sh`, `bash` (including the 3.2 in Recovery) and `zsh`. That is enforced by
+tests, not assumed: zsh does not
 word-split unquoted variables, so a loop that is correct in bash can silently iterate once under
 zsh — which in this script would have been enough to reintroduce the false positive above.
 
